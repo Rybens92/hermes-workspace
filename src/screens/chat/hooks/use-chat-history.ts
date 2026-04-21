@@ -295,7 +295,7 @@ export function useChatHistory({
       const cached = queryClient.getQueryData(historyKey)
       const optimisticMessages = Array.isArray((cached as any)?.messages)
         ? (cached as any).messages.filter((message: any) => {
-            if (message.status === 'sending') return true
+            if (message.status === 'sending' || message.status === 'sent' || message.status === 'done' || message.status === 'queued') return true
             if (message.__optimisticId) return true
             return Boolean(message.clientId)
           })
@@ -634,8 +634,13 @@ function mergeOptimisticHistoryMessages(
     }
 
     // Preserve unconfirmed optimistic messages regardless of age.
+    // Include 'sent'/'done' — the message was confirmed by the stream
+    // but may not have reached the server's history API yet.
     const isSending =
       optimisticMessage.status === 'sending' ||
+      optimisticMessage.status === 'sent' ||
+      optimisticMessage.status === 'done' ||
+      optimisticMessage.status === 'queued' ||
       Boolean(optimisticMessage.__optimisticId)
 
     if (isSending) {

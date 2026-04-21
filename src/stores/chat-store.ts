@@ -2,12 +2,25 @@ import { create } from 'zustand'
 import type {
   ChatMessage,
   MessageContent,
+  StreamToolCall,
   TextContent,
   ThinkingContent,
   ToolCallContent,
 } from '../screens/chat/types'
 
 let _streamingPersistTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * Force-complete a tool call phase for final message rendering.
+ * Hermes sometimes skips tool.completed for fast runs — without this,
+ * pills would stack forever showing "executing".
+ */
+function forceCompletePhase(phase: string | undefined): string {
+  if (phase === 'error') return 'error'
+  if (phase === 'complete' || phase === 'completed' || phase === 'done')
+    return phase!
+  return 'complete'
+}
 
 export type ChatStreamEvent =
   | {
@@ -922,6 +935,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         const nextToolCalls = [...prev.toolCalls]
 
+        // Auto-complete previous tool calls when a new one starts.
+        // Hermes processes tools sequentially — if a new tool begins, all
+        // previous tools must have finished regardless of whether a
+        // tool.completed event was emitted.
+        if (event.phase === 'start' || event.phase === 'calling') {
+          for (let i = 0; i < nextToolCalls.length; i++) {
+            const tc = nextToolCalls[i]
+            if (
+              tc.id !== toolCallId &&
+              tc.phase !== 'complete' &&
+              tc.phase !== 'completed' &&
+              tc.phase !== 'done' &&
+              tc.phase !== 'error'
+            ) {
+              nextToolCalls[i] = { ...tc, phase: 'complete' }
+            }
+          }
+        }
+
         if (existingToolIndex >= 0) {
           nextToolCalls[existingToolIndex] = {
             ...nextToolCalls[existingToolIndex],
@@ -976,15 +1008,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
           // ToolCallPill can render them even after streaming state is cleared.
           // Fast tool runs clear streaming state before React renders — embedding
           // __streamToolCalls ensures pills survive in the history message.
-          const streamToolCallsToEmbed = streaming?.toolCalls?.length
+          // Force-complete all tool calls so they show as "done" in the final message
+          // rather than stuck at "executing" (Hermes may not always emit tool.completed).
+          const rawStreamToolCalls = streaming?.toolCalls?.length
             ? streaming.toolCalls
+            : undefined
+          const streamToolCallsToEmbed = rawStreamToolCalls
+            ? rawStreamToolCalls.map((tc) => ({
+                ...tc,
+                phase: forceCompletePhase(tc.phase),
+              }))
             : undefined
           completeMessage = {
             ...cleanedMessage,
             timestamp: getMessageEventTime(cleanedMessage) ?? now,
             __receiveTime: now,
             __realtimeSequence: realtimeMessageSequence++,
-            __streamingStatus: (event.state === 'interrupted' ? 'interrupted' : 'complete') as any,
+            __streamingStatus: (event.state === 'interrupted' ? 'interrupted' : 'complete'),
             ...(streamToolCallsToEmbed
               ? { __streamToolCalls: streamToolCallsToEmbed }
               : {}),
@@ -1009,7 +1049,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
             } as TextContent)
           }
 
-          for (const toolCall of streaming.toolCalls) {
+          // Force-complete tool calls in fallback path too (same as primary path)
+          const forceCompletedToolCalls = streaming.toolCalls.map((tc) => ({
+            ...tc,
+            phase: forceCompletePhase(tc.phase),
+          }))
+          for (const toolCall of forceCompletedToolCalls) {
             content.push({
               type: 'toolCall',
               id: toolCall.id,
@@ -1025,6 +1070,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             __receiveTime: now,
             __realtimeSequence: realtimeMessageSequence++,
             __streamingStatus: 'complete',
+            // Embed force-completed stream tool calls for ToolCallPill rendering
+            __streamToolCalls: forceCompletedToolCalls,
           }
         }
 
@@ -1080,13 +1127,46 @@ export const useChatStore = create<ChatState>((set, get) => ({
           }
         }
 
+        // Force-complete any tool calls still in start/calling phase.
+        // Hermes sometimes skips tool.completed for fast runs — without this,
+        // pills stack forever showing "in progress" until the done event clears
+        // streaming state entirely.
+        if (streaming?.toolCalls?.length) {
+          const completedToolCalls = streaming.toolCalls.map((tc) =>
+            tc.phase === 'complete' ||
+            tc.phase === 'completed' ||
+            tc.phase === 'done' ||
+            tc.phase === 'error'
+              ? tc
+              : { ...tc, phase: 'complete' as const },
+          )
+          // Re-embed updated tool calls on completeMessage
+          if (completeMessage && completedToolCalls.length > 0) {
+            completeMessage.__streamToolCalls = completedToolCalls
+          }
+        }
+
         // Clear streaming state immediately — tool calls are preserved via
         // __streamToolCalls embedded on completeMessage above, so pills survive
         // in the history message without needing streaming state alive.
         // DO NOT keep a stub here — it keeps isRealtimeStreaming=true which
         // injects an invisible streaming placeholder that causes a blank gap.
         streamingMap.delete(sessionKey)
-        set({ streamingState: streamingMap, lastEventAt: now })
+
+        // Remove stale streaming placeholder from realtimeMessages to prevent
+        // duplicate tool calls. Filter unconditionally — if no placeholders
+        // exist the result is identical to the input, so no harm done.
+        const currentMessages = new Map(state.realtimeMessages)
+        const sessionMsgs = currentMessages.get(sessionKey)
+        if (sessionMsgs) {
+          const cleaned = sessionMsgs.filter(
+            (m: ChatMessage) => m.__streamingStatus !== 'streaming',
+          )
+          currentMessages.set(sessionKey, cleaned)
+          set({ streamingState: streamingMap, lastEventAt: now, realtimeMessages: currentMessages })
+        } else {
+          set({ streamingState: streamingMap, lastEventAt: now })
+        }
         if (typeof sessionStorage !== 'undefined') {
           sessionStorage.removeItem(`hermes_streaming_${sessionKey}`)
         }
@@ -1205,8 +1285,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (!matchingRealtime) return histMsg
       // Preserve attachments from the optimistic/realtime message when history doesn't have them
       const merged = mergeRealtimeAssistantMetadata(histMsg, matchingRealtime)
-      const rtAttachments = (matchingRealtime as any).attachments
-      const histAttachments = (merged as any).attachments
+      // Safety net: if history message already has toolCall entries in content,
+      // strip __streamToolCalls from the realtime overlay to prevent duplicate
+      // tool call pills (one from content, one from __streamToolCalls).
+      const hasToolCallsInContent = Array.isArray(merged.content) &&
+        merged.content.some((p: MessageContent) => p.type === 'toolCall')
+      if (hasToolCallsInContent && merged.__streamToolCalls) {
+        const { __streamToolCalls, ...rest } = merged
+        const rtAttachments = matchingRealtime.attachments
+        const histAttachments = rest.attachments
+        if (
+          Array.isArray(rtAttachments) &&
+          rtAttachments.length > 0 &&
+          (!Array.isArray(histAttachments) || histAttachments.length === 0)
+        ) {
+          return { ...rest, attachments: rtAttachments }
+        }
+        return rest
+      }
+      const rtAttachments = matchingRealtime.attachments
+      const histAttachments = merged.attachments
       if (
         Array.isArray(rtAttachments) &&
         rtAttachments.length > 0 &&
@@ -1298,20 +1396,16 @@ function mergeRealtimeAssistantMetadata(
     return historyMessage
   }
 
-  const realtimeToolCalls = Array.isArray(
-    (realtimeMessage as any).__streamToolCalls,
-  )
-    ? (realtimeMessage as any).__streamToolCalls
+  const realtimeToolCalls = Array.isArray(realtimeMessage.__streamToolCalls)
+    ? realtimeMessage.__streamToolCalls
     : []
-  const historyToolCalls = Array.isArray(
-    (historyMessage as any).__streamToolCalls,
-  )
-    ? (historyMessage as any).__streamToolCalls
+  const historyToolCalls = Array.isArray(historyMessage.__streamToolCalls)
+    ? historyMessage.__streamToolCalls
     : []
   const historyStreamToolCalls = Array.isArray(
-    (historyMessage as any).streamToolCalls,
+    (historyMessage as Record<string, unknown>).streamToolCalls,
   )
-    ? (historyMessage as any).streamToolCalls
+    ? ((historyMessage as Record<string, unknown>).streamToolCalls as Array<StreamToolCall>)
     : []
 
   if (

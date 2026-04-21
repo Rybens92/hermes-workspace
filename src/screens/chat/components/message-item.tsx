@@ -1829,7 +1829,7 @@ function MessageItemComponent({
   // Get tool calls from this message (for assistant messages)
   const toolCalls = role === 'assistant' ? getToolCallsFromMessage(message) : []
   const embeddedStreamToolCalls = useMemo(() => {
-    const value = (message as any).__streamToolCalls
+    const value = message.__streamToolCalls
     if (!Array.isArray(value)) return []
     return value
       .map((entry: any) => ({
@@ -1956,30 +1956,58 @@ function MessageItemComponent({
     [effectiveStreamToolCalls, effectiveIsStreaming],
   )
   const inlineToolSections = useMemo<Array<InlineToolSection>>(
-    () => [
-      ...streamToolSections,
-      ...toolParts.map((toolPart, index) => {
-        const rawOutput = toolPart.output
-        let outputText = ''
-        if (rawOutput) {
-          if (typeof rawOutput.output === 'string') {
-            outputText = rawOutput.output
-          } else {
-            outputText = JSON.stringify(rawOutput, null, 2)
-          }
-        }
+    () => {
+      // Deduplicate by tool call key to prevent the same tool call appearing
+      // from both streaming state (streamToolSections) and message.content
+      // (toolParts) during the streaming→history transition.
+      const seen = new Set<string>()
+      const result: Array<InlineToolSection> = []
 
-        return {
-          key: toolPart.toolCallId || `${toolPart.type}-${index}`,
-          type: toolPart.type,
-          input: toolPart.input,
-          outputText,
-          errorText: toolPart.errorText,
-          state: toolPart.state,
+      // Source 1: streaming tool calls (SSE state) — highest priority
+      for (const section of streamToolSections) {
+        if (!seen.has(section.key)) {
+          seen.add(section.key)
+          result.push(section)
         }
-      }),
-      ...attachedToolSections,
-    ],
+      }
+
+      // Source 2: toolCall content blocks in message
+      // Key format matches Source 1 (streaming) so dedup works across both sources:
+      // toolCallId when available, else name-index fallback.
+      for (const [index, toolPart] of toolParts.entries()) {
+        const key = toolPart.toolCallId || `${toolPart.type}-${index}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          const rawOutput = toolPart.output
+          let outputText = ''
+          if (rawOutput) {
+            if (typeof rawOutput.output === 'string') {
+              outputText = rawOutput.output
+            } else {
+              outputText = JSON.stringify(rawOutput, null, 2)
+            }
+          }
+          result.push({
+            key,
+            type: toolPart.type,
+            input: toolPart.input,
+            outputText,
+            errorText: toolPart.errorText,
+            state: toolPart.state,
+          })
+        }
+      }
+
+      // Source 3: attached tool-result messages
+      for (const section of attachedToolSections) {
+        if (!seen.has(section.key)) {
+          seen.add(section.key)
+          result.push(section)
+        }
+      }
+
+      return result
+    },
     [attachedToolSections, streamToolSections, toolParts],
   )
   // When streaming is done, force all tool sections to completed state

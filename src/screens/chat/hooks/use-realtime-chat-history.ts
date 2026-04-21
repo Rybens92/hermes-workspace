@@ -172,6 +172,10 @@ export function useRealtimeChatHistory({
     void backfillHistory()
   }, [backfillHistory, effectiveSessionKey, enabled])
 
+  // Store selectors needed inside useChatStream callbacks — must be declared
+  // before useChatStream to avoid "used before declaration" TS errors.
+  const clearRealtimeBuffer = useChatStore((s) => s.clearRealtimeBuffer)
+
   const { connectionState, lastError, reconnect } = useChatStream({
     sessionKey: effectiveSessionKey === 'new' ? undefined : effectiveSessionKey,
     enabled: enabled && effectiveSessionKey !== 'new',
@@ -325,9 +329,19 @@ export function useRealtimeChatHistory({
             const prevCount =
               (prevData?.messages as Array<unknown> | undefined)?.length ?? 0
 
-            // Refetch immediately — done event message is already in realtime store
+            // Refetch immediately — done event message is already in realtime store.
+            // After history arrives, clear realtime buffer so mergeHistoryMessages
+            // returns clean server data (properly split into rounds) instead of the
+            // monolithic streaming placeholder + completeMessage.
             queryClient.invalidateQueries({ queryKey: key }).then(() => {
               clearCompletedStreaming()
+
+              // Give React one render cycle to merge the fresh history, then
+              // clear the realtime buffer. This ensures the UI swaps from the
+              // single monolithic streaming bubble to properly-split history.
+              requestAnimationFrame(() => {
+                clearRealtimeBuffer(effectiveSessionKey)
+              })
 
               // Check for compaction — significant message count drop
               const newData =
@@ -355,6 +369,7 @@ export function useRealtimeChatHistory({
       },
       [
         clearCompletedStreaming,
+        clearRealtimeBuffer,
         effectiveFriendlyId,
         effectiveSessionKey,
         onCompactionEnd,
@@ -385,7 +400,6 @@ export function useRealtimeChatHistory({
   const mergeHistoryMessages = useChatStore((s) => s.mergeHistoryMessages)
   const clearSession = useChatStore((s) => s.clearSession)
   const lastEventAt = useChatStore((s) => s.lastEventAt)
-  const clearRealtimeBuffer = useChatStore((s) => s.clearRealtimeBuffer)
   const realtimeMessages = useChatStore(
     (s) => s.realtimeMessages.get(effectiveSessionKey) ?? EMPTY_MESSAGES,
   )

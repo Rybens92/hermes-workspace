@@ -1088,7 +1088,20 @@ export function ChatScreen({
       setSending(false)
       // Clear waitingForResponse so ThinkingBubble hides and message renders
       streamFinish()
-    }, [queryClient, streamFinish]),
+
+      // After streaming completes, clear realtime buffer so the UI swaps from
+      // the monolithic streaming bubble to properly-split history from server.
+      // Double rAF: onComplete fires mid-React-cycle, so we need two frames
+      // to let React reconcile before clearing the buffer.
+      const sessionToClear = resolvedSessionKey
+      if (sessionToClear) {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            useChatStore.getState().clearRealtimeBuffer(sessionToClear)
+          })
+        })
+      }
+    }, [queryClient, streamFinish, resolvedSessionKey]),
     onError: useCallback(
       (messageText: string) => {
         const activeSend = activeSendRef.current
@@ -1189,6 +1202,13 @@ export function ChatScreen({
         return true
       }
       if (msg.role === 'assistant') {
+        // When not streaming, filter out streaming-phase artifacts.
+        // Messages with __streamingStatus are monolithic completeMessage objects
+        // created by processStoreEvent 'done' handler — the server provides
+        // properly-split per-round messages without this property.
+        if (!activeIsRealtimeStreaming && msg.__streamingStatus) {
+          return false
+        }
         if (msg.__streamingStatus === 'streaming') return true
         if ((msg as any).__optimisticId && !msg.content?.length) return true
         if (textFromMessage(msg).trim().length > 0) return true
@@ -1280,9 +1300,16 @@ export function ChatScreen({
       phase: toolCall.phase,
     }))
 
+    // Include streaming text as a content block so buildInlineToolRenderPlan
+    // can interleave text between tool calls instead of showing only pills.
+    const streamingContent: Array<MessageContent> = []
+    if (stableActiveStreamingText && stableActiveStreamingText.trim().length > 0) {
+      streamingContent.push({ type: 'text', text: stableActiveStreamingText })
+    }
+
     const streamingMsg = {
       role: 'assistant',
-      content: [],
+      content: streamingContent,
       __optimisticId: 'streaming-current',
       __streamingStatus: 'streaming',
       __streamingText: stableActiveStreamingText,

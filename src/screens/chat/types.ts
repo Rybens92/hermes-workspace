@@ -41,7 +41,21 @@ export type ChatAttachment = {
   height?: number
 }
 
-export type StreamingStatus = 'idle' | 'streaming' | 'complete' | 'error'
+export type StreamToolCall = {
+  id?: string
+  name?: string
+  phase?: string
+  args?: unknown
+  preview?: string
+  result?: string
+}
+
+export type StreamingStatus =
+  | 'idle'
+  | 'streaming'
+  | 'complete'
+  | 'error'
+  | 'interrupted'
 
 export type ChatMessage = {
   role?: string
@@ -57,6 +71,8 @@ export type ChatMessage = {
   __streamingStatus?: StreamingStatus
   __streamingText?: string
   __streamingThinking?: string
+  /** Force-completed tool calls from streaming state, preserved for ToolCallPill rendering */
+  __streamToolCalls?: Array<StreamToolCall>
 }
 
 export type SessionTitleStatus = 'idle' | 'generating' | 'ready' | 'error'

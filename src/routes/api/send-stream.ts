@@ -591,6 +591,10 @@ export const Route = createFileRoute('/api/send-stream')({
               }
 
               let startedSent = false
+              // Stable tool call ID tracking: maps tool_name -> sequential index
+              // so that start/progress/completed events for the same tool call
+              // resolve to the same ID even when Hermes omits tool_call_id.
+              const toolCallSequence = new Map<string, number>()
               // In enhanced mode, the HTTP stream response delivers all events
               // directly to useStreamingMessage. Skip publishChatEvent to prevent
               // useRealtimeChatHistory from creating duplicate message bubbles.
@@ -616,6 +620,30 @@ export const Route = createFileRoute('/api/send-stream')({
                       typeof data.run_id === 'string' && data.run_id.trim()
                         ? data.run_id
                         : (activeRunId ?? undefined)
+
+                    // Stable tool call ID: increment per tool name so start→progress→completed
+                    // all resolve to the same ID. Only increments on 'start' phase events.
+                    function getStableToolCallId(
+                      data: Record<string, unknown>,
+                      toolName: string,
+                      phase: string,
+                    ): string {
+                      // First try Hermes' own ID
+                      const hermesId = getToolCallId(data, runId, toolName)
+                      if (hermesId) return hermesId
+
+                      // Fallback: name-based sequence.
+                      // Only increment on 'start'/'pending' — if 'complete'/'error'
+                      // arrives first (fast-run) we reuse the current seq so a
+                      // later 'start' for the same call still resolves to the same ID.
+                      const isStart = phase === 'start' || phase === 'pending'
+                      if (isStart) {
+                        const next = (toolCallSequence.get(toolName) ?? 0) + 1
+                        toolCallSequence.set(toolName, next)
+                      }
+                      const seq = toolCallSequence.get(toolName) ?? 1
+                      return `${runId || 'run'}:${toolName}:${seq}`
+                    }
 
                     if (runId && !activeRunId) {
                       activeRunId = runId
@@ -729,13 +757,13 @@ export const Route = createFileRoute('/api/send-stream')({
                         typeof data.preview === 'string'
                           ? data.preview
                           : undefined
-                      const translated = {
-                        phase:
-                          event === 'tool.pending' || event === 'tool.started'
+                      const phase = event === 'tool.pending' || event === 'tool.started'
                             ? 'start'
-                            : 'calling',
+                            : 'calling'
+                      const translated = {
+                        phase,
                         name: toolName,
-                        toolCallId: getToolCallId(data, runId, toolName),
+                        toolCallId: getStableToolCallId(data, toolName, phase),
                         args: getToolArgs(data),
                         preview,
                         sessionKey: sessionKeyFromEvent,
@@ -763,7 +791,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       const translated = {
                         phase: 'calling',
                         name: toolName,
-                        toolCallId: getToolCallId(data, runId, toolName),
+                        toolCallId: getStableToolCallId(data, toolName, 'calling'),
                         args: getToolArgs(data),
                         result: delta || undefined,
                         sessionKey: sessionKeyFromEvent,
@@ -780,7 +808,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       const translated = {
                         phase: 'complete',
                         name: toolName,
-                        toolCallId: getToolCallId(data, runId, toolName),
+                        toolCallId: getStableToolCallId(data, toolName, 'complete'),
                         args: getToolArgs(data),
                         result: resultPreview.slice(0, 4000),
                         sessionKey: sessionKeyFromEvent,
@@ -820,7 +848,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       const translated = {
                         phase: 'complete',
                         name: 'memory',
-                        toolCallId: readString(data.tool_call_id) || undefined,
+                        toolCallId: readString(data.tool_call_id) || getStableToolCallId(data, 'memory', 'complete'),
                         result:
                           readString(data.message) ||
                           `Updated ${readString(data.target) || 'memory'}`,
@@ -840,7 +868,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       const translated = {
                         phase: 'complete',
                         name: 'skill',
-                        toolCallId: readString(data.tool_call_id) || undefined,
+                        toolCallId: readString(data.tool_call_id) || getStableToolCallId(data, 'skill', 'complete'),
                         result:
                           readString(skill.name) ||
                           readString(data.skill_name) ||
@@ -863,7 +891,7 @@ export const Route = createFileRoute('/api/send-stream')({
                       const translated = {
                         phase: 'error',
                         name: toolName,
-                        toolCallId: getToolCallId(data, runId, toolName),
+                        toolCallId: getStableToolCallId(data, toolName, 'complete'),
                         result: errorMessage,
                         sessionKey: sessionKeyFromEvent,
                         runId,
@@ -891,10 +919,21 @@ export const Route = createFileRoute('/api/send-stream')({
                     }
 
                     if (event === 'run.completed') {
-                      const translated = {
+                      // Include message payload if Hermes provides it — the
+                      // chat-store done handler falls back to streaming state
+                      // reconstruction when message is absent, which loses tool
+                      // calls and text when streamingState is cleared.
+                      const doneMessage =
+                        data.message && typeof data.message === 'object'
+                          ? (data.message as Record<string, unknown>)
+                          : undefined
+                      const translated: Record<string, unknown> = {
                         state: 'complete',
                         sessionKey: sessionKeyFromEvent,
                         runId,
+                      }
+                      if (doneMessage) {
+                        translated.message = doneMessage
                       }
                       sendEvent('done', translated)
                       skipPublish || publishChatEvent('done', translated)
